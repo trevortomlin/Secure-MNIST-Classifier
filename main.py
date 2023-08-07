@@ -1,3 +1,4 @@
+from os import XATTR_SIZE_MAX
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Optional
 import flwr as fl
@@ -10,16 +11,22 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
 from torchvision.datasets import MNIST
 from flwr.common import Metrics
-
+import brevitas.nn as qnn
+from concrete.ml.torch.compile import compile_brevitas_qat_model
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32
 NUM_CLIENTS = 5
-
+N_FEAT = 784
+n_bits = 3
 
 def load_datasets():
     transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5), (0.5))]
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5), (0.5)),
+            transforms.Lambda(lambda x: torch.flatten(x)),
+        ]
     )
     trainset = MNIST("./dataset", train=True, download=True, transform=transform)
     testset = MNIST("./dataset", train=False, download=True, transform=transform)
@@ -27,6 +34,8 @@ def load_datasets():
     partition_size = len(trainset) // NUM_CLIENTS
     lengths = [partition_size] * NUM_CLIENTS
     datasets = random_split(trainset, lengths, torch.Generator().manual_seed(42))
+
+    #print(trainset[0][0])
 
     trainloaders = []
     valloaders = []
@@ -41,31 +50,59 @@ def load_datasets():
     return trainloaders, valloaders, testloader
 
 
+# class Net(nn.Module):
+#     def __init__(self):
+#         super(Net, self).__init__()
+#         self.conv1 = nn.Conv2d(1, 32, 3, 1)
+#         self.conv2 = nn.Conv2d(32, 64, 3, 1)
+#         self.dropout1 = nn.Dropout(0.25)
+#         self.dropout2 = nn.Dropout(0.5)
+#         self.fc1 = nn.Linear(9216, 128)
+#         self.fc2 = nn.Linear(128, 10)
+
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = F.relu(x)
+#         x = self.conv2(x)
+#         x = F.relu(x)
+#         x = F.max_pool2d(x, 2)
+#         x = self.dropout1(x)
+#         x = torch.flatten(x, 1)
+#         x = self.fc1(x)
+#         x = F.relu(x)
+#         x = self.dropout2(x)
+#         x = self.fc2(x)
+#         output = F.log_softmax(x, dim=1)
+#         return output
+
 class Net(nn.Module):
+  def __init__(self):
+    super(Net, self).__init__()
+
+    self.fc1 = nn.Linear(N_FEAT, 100)
+    self.fc2 = nn.Linear(100, 10)
+
+  def forward(self, x):
+    x = torch.relu(self.fc1(x))
+    x = self.fc2(x)
+    return x
+
+
+class FHENet(nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(9216, 128)
-        self.fc2 = nn.Linear(128, 10)
+      super(FHENet, self).__init__()
+
+      self.quant_inp = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
+      self.fc1 = qnn.QuantLinear(N_FEAT, 100, True, weight_bit_width=n_bits, bias_quant=None)
+      self.relu1 = qnn.QuantReLU(bit_width=n_bits, return_quant_tensor=True)
+      self.fc2 = qnn.QuantLinear(100, 10, True, weight_bit_width=n_bits, bias_quant=None)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
-        return output
-    
+      x = self.quant_inp(x)
+      x = self.relu1(self.fc1(x))
+      x = self.fc2(x)
+      return x
+
 
 def train(net, trainloader, epochs: int, verbose=False):
     """Train the network on the training set."""
@@ -169,39 +206,71 @@ def evaluate(
 def main():
     trainloaders, valloaders, testloader = load_datasets()
 
-    # trainloader = trainloaders[0]
-    # valloader = valloaders[0]
-    # net = Net().to(DEVICE)
+    #exit()
 
-    # for epoch in range(5):
-    #     train(net, trainloader, 1)
-    #     loss, accuracy = test(net, valloader)
-    #     print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
+    trainloader = trainloaders[0]
+    valloader = valloaders[0]
+    net = Net().to(DEVICE)
 
-    # loss, accuracy = test(net, testloader)
-    # print(f"Final test set performance:\n\tloss {loss}\n\taccuracy {accuracy}")
+    print("="*10 + "Normal Net" + "="*10)
 
-    strategy = fl.server.strategy.FedAvg(
-        fraction_fit=1.0,
-        fraction_evaluate=0.5,
-        min_fit_clients=1,
-        min_evaluate_clients=2,
-        min_available_clients=5,
-        evaluate_metrics_aggregation_fn=weighted_average,
-        evaluate_fn=lambda x, y, z: evaluate(x, y, z, valloaders),
+    for epoch in range(0):
+        train(net, trainloader, 1)
+        loss, accuracy = test(net, valloader)
+        print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
+
+    loss, accuracy = test(net, testloader)
+    print(f"Final test set performance:\n\tloss {loss}\n\taccuracy {accuracy}")
+
+    print("="*10 + "Quantized Net" + "="*10)
+
+    fhe_net = FHENet()
+
+    for epoch in range(1):
+      train(fhe_net, trainloader, 1)
+      loss, accuracy = test(fhe_net, valloader)
+      print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
+
+    #exit()
+
+    quantized_module = compile_brevitas_qat_model(
+        fhe_net,
+        next(iter(trainloader))[0].numpy(),
     )
 
-    client_resources = None
-    if DEVICE.type == "cuda":
-        client_resources = {"num_gpus": 1}
+    y_true = next(iter(valloader))[1].numpy()
 
-    fl.simulation.start_simulation(
-        client_fn = lambda x: client_fn(x, trainloaders, valloaders),
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=1),
-        strategy=strategy,
-        client_resources=client_resources,
-    )
+    x_test_q = quantized_module.quantize_input(next(iter(valloader))[0].numpy())
+    y_pred = quantized_module.quantized_forward(x_test_q, fhe="simulate")
+    y_pred = quantized_module.dequantize_output(y_pred)
+
+    y_pred = np.argmax(y_pred, axis=1)
+
+    accuracy = np.sum(np.equal(y_pred, y_true))/len(y_true)
+
+    print(f"FHE Test accuracy: {accuracy*100:.2f}")
+
+    # strategy = fl.server.strategy.FedAvg(
+    #     fraction_fit=1.0,
+    #     fraction_evaluate=0.5,
+    #     min_fit_clients=1,
+    #     min_evaluate_clients=2,
+    #     min_available_clients=5,
+    #     evaluate_metrics_aggregation_fn=weighted_average,
+    #     evaluate_fn=lambda x, y, z: evaluate(x, y, z, valloaders),
+    # )
+
+    # client_resources = None
+    # if DEVICE.type == "cuda":
+    #     client_resources = {"num_gpus": 1}
+
+    # fl.simulation.start_simulation(
+    #     client_fn = lambda x: client_fn(x, trainloaders, valloaders),
+    #     num_clients=NUM_CLIENTS,
+    #     config=fl.server.ServerConfig(num_rounds=1),
+    #     strategy=strategy,
+    #     client_resources=client_resources,
+    # )
 
 
 if __name__ == "__main__":
