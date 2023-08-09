@@ -13,12 +13,18 @@ from torchvision.datasets import MNIST
 from flwr.common import Metrics
 import brevitas.nn as qnn
 from concrete.ml.torch.compile import compile_brevitas_qat_model
+from sklearn.metrics import log_loss, accuracy_score
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32
 NUM_CLIENTS = 5
 N_FEAT = 784
 n_bits = 3
+
+
+
+from brevitas import config
+config.IGNORE_MISSING_KEYS = True
 
 def load_datasets():
     transform = transforms.Compose(
@@ -75,22 +81,22 @@ def load_datasets():
 #         output = F.log_softmax(x, dim=1)
 #         return output
 
+# class Net(nn.Module):
+#   def __init__(self):
+#     super(Net, self).__init__()
+
+#     self.fc1 = nn.Linear(N_FEAT, 100)
+#     self.fc2 = nn.Linear(100, 10)
+
+#   def forward(self, x):
+#     x = torch.relu(self.fc1(x))
+#     x = self.fc2(x)
+#     return x
+
+
 class Net(nn.Module):
-  def __init__(self):
-    super(Net, self).__init__()
-
-    self.fc1 = nn.Linear(N_FEAT, 100)
-    self.fc2 = nn.Linear(100, 10)
-
-  def forward(self, x):
-    x = torch.relu(self.fc1(x))
-    x = self.fc2(x)
-    return x
-
-
-class FHENet(nn.Module):
     def __init__(self):
-      super(FHENet, self).__init__()
+      super(Net, self).__init__()
 
       self.quant_inp = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
       self.fc1 = qnn.QuantLinear(N_FEAT, 100, True, weight_bit_width=n_bits, bias_quant=None)
@@ -145,13 +151,19 @@ def test(net, testloader):
 
 
 def get_parameters(net) -> List[np.ndarray]:
-    return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    params = [val.cpu().numpy() for k, val in net.state_dict().items() if "act_quant" not in k]
+    #print(params[0])
+    #print(f"KEYS IN NET: {net.state_dict().keys()}")
+    return params
 
 
 def set_parameters(net, parameters: List[np.ndarray]):
     params_dict = zip(net.state_dict().keys(), parameters)
+    #print(params_dict)
+    #params_dict = [(x,y) for (x,y) in zip(net.state_dict().keys(), parameters) ]
     state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
+    #print(f"STATE DICT KEYS: {list(state_dict.keys()).filter(lambda x, y: 'act_quant' not in x)}")
+    net.load_state_dict(state_dict, strict=False)
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -189,88 +201,154 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     return {"accuracy": sum(accuracies) / sum(examples)}
 
 
+# def evaluate(
+#     server_round: int,
+#     parameters: fl.common.NDArrays,
+#     config: Dict[str, fl.common.Scalar],
+#     valloaders,
+# ) -> Optional[Tuple[float, Dict[str, fl.common.Scalar]]]:
+#     net = Net().to(DEVICE)
+#     valloader = valloaders[0]
+#     set_parameters(net, parameters)
+#     loss, accuracy = test(net, valloader)
+#     print(f"Server-side evaluation loss {loss} / accuracy {accuracy}")
+#     return loss, {"accuracy": accuracy}
+
+
 def evaluate(
     server_round: int,
     parameters: fl.common.NDArrays,
     config: Dict[str, fl.common.Scalar],
     valloaders,
 ) -> Optional[Tuple[float, Dict[str, fl.common.Scalar]]]:
-    net = Net().to(DEVICE)
-    valloader = valloaders[0]
-    set_parameters(net, parameters)
-    loss, accuracy = test(net, valloader)
-    print(f"Server-side evaluation loss {loss} / accuracy {accuracy}")
-    return loss, {"accuracy": accuracy}
 
+    valloader = valloaders[0]
+
+    X_test = next(iter(valloader))[0].numpy()
+    y_test =  next(iter(valloader))[1].numpy()
+
+    net = Net()
+    set_parameters(net, parameters)
+
+    quantized_module = compile_brevitas_qat_model(
+        net,
+        next(iter(valloader))[0].numpy(),
+    )
+
+    X_test_q = quantized_module.quantize_input(X_test)
+    y_pred = quantized_module.quantized_forward(X_test_q, fhe="simulate")
+    y_pred = quantized_module.dequantize_output(y_pred)
+
+    #y_pred = np.argmax(y_pred, axis=1)
+
+    # def softmax(x):
+    #   """Compute softmax values for each sets of scores in x."""
+    #   e_x = np.exp(x - np.max(x))
+    #   return e_x / e_x.sum()
+
+    # y_pred = softmax(y_pred)
+
+    # print(y_pred[0])
+    # print(y_pred.shape)
+    # print(y_test[0])
+    # print(y_test.shape)
+
+    #print(log_loss(y_test[0], y_pred))
+
+
+    loss = log_loss(y_test, y_pred, labels=[x for x in range(10)])
+    accuracy = accuracy_score(y_test, np.argmax(y_pred, axis=1))
+
+    print(f"SERVER EVAL:\n\tLOSS: {loss}\n\tACCURACY:{accuracy}")
+
+    return loss, {"accuracy": accuracy}
+    # net = Net().to(DEVICE)
+    # valloader = valloaders[0]
+    # set_parameters(net, parameters)
+    # loss, accuracy = test(net, valloader)
+    # print(f"Server-side evaluation loss {loss} / accuracy {accuracy}")
+    # return loss, {"accuracy": accuracy}
 
 def main():
     trainloaders, valloaders, testloader = load_datasets()
 
-    #exit()
+    # trainloader = trainloaders[0]
+    # valloader = valloaders[0]
+    # net = Net().to(DEVICE)
 
-    trainloader = trainloaders[0]
-    valloader = valloaders[0]
-    net = Net().to(DEVICE)
+    # print("="*10 + "Normal Net" + "="*10)
 
-    print("="*10 + "Normal Net" + "="*10)
+    # for epoch in range(0):
+    #     train(net, trainloader, 1)
+    #     loss, accuracy = test(net, valloader)
+    #     print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
 
-    for epoch in range(0):
-        train(net, trainloader, 1)
-        loss, accuracy = test(net, valloader)
-        print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
+    # loss, accuracy = test(net, testloader)
+    # print(f"Final test set performance:\n\tloss {loss}\n\taccuracy {accuracy}")
 
-    loss, accuracy = test(net, testloader)
-    print(f"Final test set performance:\n\tloss {loss}\n\taccuracy {accuracy}")
+    # print("="*10 + "Quantized Net" + "="*10)
 
-    print("="*10 + "Quantized Net" + "="*10)
+    # fhe_net = Net()
 
-    fhe_net = FHENet()
+    # for epoch in range(1):
+    #   train(fhe_net, trainloader, 1)
+    #   loss, accuracy = test(fhe_net, valloader)
+    #   print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
 
-    for epoch in range(1):
-      train(fhe_net, trainloader, 1)
-      loss, accuracy = test(fhe_net, valloader)
-      print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
+    # print(fhe_net.state_dict().keys())
 
-    #exit()
+    # params = get_parameters(fhe_net)
 
-    quantized_module = compile_brevitas_qat_model(
-        fhe_net,
-        next(iter(trainloader))[0].numpy(),
+    # #print(params.keys())
+
+    # #sd = fhe_net.state_dict()
+
+    # #print(params)
+
+    # fhe_net = Net()
+
+    # #fhe_net.load_state_dict(sd)
+
+    # set_parameters(fhe_net, params)
+
+    # quantized_module = compile_brevitas_qat_model(
+    #     fhe_net,
+    #     next(iter(trainloader))[0].numpy(),
+    # )
+
+    # y_true = next(iter(valloader))[1].numpy()
+
+    # x_test_q = quantized_module.quantize_input(next(iter(valloader))[0].numpy())
+    # y_pred = quantized_module.quantized_forward(x_test_q, fhe="simulate")
+    # y_pred = quantized_module.dequantize_output(y_pred)
+
+    # y_pred = np.argmax(y_pred, axis=1)
+
+    # accuracy = np.sum(np.equal(y_pred, y_true))/len(y_true)
+
+    # print(f"FHE Test accuracy: {accuracy*100:.2f}")
+
+    strategy = fl.server.strategy.FedAvg(
+        fraction_fit=1.0,
+        fraction_evaluate=0.5,
+        min_fit_clients=1,
+        min_evaluate_clients=2,
+        min_available_clients=5,
+        evaluate_metrics_aggregation_fn=weighted_average,
+        evaluate_fn=lambda x, y, z: evaluate(x, y, z, valloaders),
     )
 
-    y_true = next(iter(valloader))[1].numpy()
+    client_resources = None
+    if DEVICE.type == "cuda":
+        client_resources = {"num_gpus": 1}
 
-    x_test_q = quantized_module.quantize_input(next(iter(valloader))[0].numpy())
-    y_pred = quantized_module.quantized_forward(x_test_q, fhe="simulate")
-    y_pred = quantized_module.dequantize_output(y_pred)
-
-    y_pred = np.argmax(y_pred, axis=1)
-
-    accuracy = np.sum(np.equal(y_pred, y_true))/len(y_true)
-
-    print(f"FHE Test accuracy: {accuracy*100:.2f}")
-
-    # strategy = fl.server.strategy.FedAvg(
-    #     fraction_fit=1.0,
-    #     fraction_evaluate=0.5,
-    #     min_fit_clients=1,
-    #     min_evaluate_clients=2,
-    #     min_available_clients=5,
-    #     evaluate_metrics_aggregation_fn=weighted_average,
-    #     evaluate_fn=lambda x, y, z: evaluate(x, y, z, valloaders),
-    # )
-
-    # client_resources = None
-    # if DEVICE.type == "cuda":
-    #     client_resources = {"num_gpus": 1}
-
-    # fl.simulation.start_simulation(
-    #     client_fn = lambda x: client_fn(x, trainloaders, valloaders),
-    #     num_clients=NUM_CLIENTS,
-    #     config=fl.server.ServerConfig(num_rounds=1),
-    #     strategy=strategy,
-    #     client_resources=client_resources,
-    # )
+    fl.simulation.start_simulation(
+        client_fn = lambda x: client_fn(x, trainloaders, valloaders),
+        num_clients=NUM_CLIENTS,
+        config=fl.server.ServerConfig(num_rounds=3),
+        strategy=strategy,
+        client_resources=client_resources,
+    )
 
 
 if __name__ == "__main__":
