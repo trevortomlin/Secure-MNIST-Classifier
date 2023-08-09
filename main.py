@@ -74,14 +74,6 @@ class Net(nn.Module):
       return x
 
 
-# DP-SGD
-# Code From:
-# https://medium.com/pytorch/differential-privacy-series-part-1-dp-sgd-algorithm-explained-12512c3959a3
-# Steps:
-#   1. Compute individial gradients
-#   2. Clip gradient norms
-#   3. Aggregrate individual gradients into single gradient
-#   4. Add noise to the gradient
 def train(net, trainloader, epochs: int, verbose=False):
     criterion = nn.CrossEntropyLoss()
     
@@ -98,12 +90,10 @@ def train(net, trainloader, epochs: int, verbose=False):
             loss = criterion(y_hat, y_batch)
             loss.backward()
 
-            # Add differential privacy noise to gradients
             for param in net.parameters():
                 noise = torch.normal(mean=0, std=NOISE_MULTIPLIER * MAX_GRAD_NORM, size=param.grad.shape)
                 param.grad += noise
 
-            # Clip gradients to enforce privacy
             torch.nn.utils.clip_grad_norm_(net.parameters(), MAX_GRAD_NORM)
 
             optimizer.step()
@@ -116,30 +106,6 @@ def train(net, trainloader, epochs: int, verbose=False):
         epoch_acc = correct / total
         if verbose:
             print(f"Epoch {epoch+1}: train loss {epoch_loss}, accuracy {epoch_acc}")
-
-
-
-# def train(net, trainloader, epochs: int, verbose=False):
-  
-#     criterion = torch.nn.CrossEntropyLoss()
-#     optimizer = torch.optim.Adam(net.parameters())
-#     net.train()
-#     for epoch in range(epochs):
-#         correct, total, epoch_loss = 0, 0, 0.0
-#         for images, labels in trainloader:
-#             images, labels = images.to(DEVICE), labels.to(DEVICE)
-#             optimizer.zero_grad()
-#             outputs = net(images)
-#             loss = criterion(outputs, labels)
-#             loss.backward()
-#             optimizer.step()
-#             epoch_loss += loss
-#             total += labels.size(0)
-#             correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
-#         epoch_loss /= len(trainloader.dataset)
-#         epoch_acc = correct / total
-#         if verbose:
-#             print(f"Epoch {epoch+1}: train loss {epoch_loss}, accuracy {epoch_acc}")
 
 
 def test(net, testloader):
@@ -239,62 +205,6 @@ def evaluate(
 
 def main():
     trainloaders, valloaders, testloader = load_datasets()
-
-    # trainloader = trainloaders[0]
-    # valloader = valloaders[0]
-    # net = Net().to(DEVICE)
-
-    # # print("="*10 + "Normal Net" + "="*10)
-
-    # # for epoch in range(0):
-    # #     train(net, trainloader, 1)
-    # #     loss, accuracy = test(net, valloader)
-    # #     print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
-
-    # # loss, accuracy = test(net, testloader)
-    # # print(f"Final test set performance:\n\tloss {loss}\n\taccuracy {accuracy}")
-
-    # print("="*10 + "Quantized Net" + "="*10)
-
-    # fhe_net = Net()
-
-    # for epoch in range(5):
-    #   train_dp(fhe_net, trainloader, 1)
-    #   loss, accuracy = test(fhe_net, valloader)
-    #   print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
-
-    # # print(fhe_net.state_dict().keys())
-
-    # # params = get_parameters(fhe_net)
-
-    # # #print(params.keys())
-
-    # # #sd = fhe_net.state_dict()
-
-    # # #print(params)
-
-    # # fhe_net = Net()
-
-    # # #fhe_net.load_state_dict(sd)
-
-    # # set_parameters(fhe_net, params)
-
-    # # quantized_module = compile_brevitas_qat_model(
-    # #     fhe_net,
-    # #     next(iter(trainloader))[0].numpy(),
-    # # )
-
-    # # y_true = next(iter(valloader))[1].numpy()
-
-    # # x_test_q = quantized_module.quantize_input(next(iter(valloader))[0].numpy())
-    # # y_pred = quantized_module.quantized_forward(x_test_q, fhe="simulate")
-    # # y_pred = quantized_module.dequantize_output(y_pred)
-
-    # # y_pred = np.argmax(y_pred, axis=1)
-
-    # # accuracy = np.sum(np.equal(y_pred, y_true))/len(y_true)
-
-    # # print(f"FHE Test accuracy: {accuracy*100:.2f}")
 
     strategy = fl.server.strategy.FedAvg(
         fraction_fit=1.0,
